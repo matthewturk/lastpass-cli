@@ -1,7 +1,7 @@
 /*
  * https endpoints for shared folder manipulation
  *
- * Copyright (C) 2014-2018 LastPass.
+ * Copyright (C) 2014-2024 LastPass.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -66,13 +66,16 @@ int lastpass_share_get_user_by_uid(const struct session *session,
 				   struct share_user *user)
 {
 	_cleanup_free_ char *reply = NULL;
+	_cleanup_free_ char *uid_param;
 	size_t len;
+
+	xasprintf(&uid_param, "{\"%s\":{}}", uid);
 
 	/* get the pubkey for the user/group */
 	reply = http_post_lastpass("share.php", session, &len,
 				   "token", session->token,
 				   "getpubkey", "1",
-				   "uid", uid,
+				   "uid", uid_param,
 				   "xmlr", "1", NULL);
 
 	return xml_parse_share_getpubkey(reply, user);
@@ -216,10 +219,9 @@ int lastpass_share_create(const struct session *session, const char *sharename)
 	_cleanup_free_ unsigned char *enc_share_key = NULL;
 	_cleanup_free_ char *sf_fullname = NULL;
 	_cleanup_free_ char *hex_enc_share_key = NULL;
+	_cleanup_free_ char *hex_hash = NULL;
 
-	unsigned char pw[KDF_HASH_LEN * 2];
-	unsigned char key[KDF_HASH_LEN];
-	char hash[KDF_HEX_LEN];
+	unsigned char key[SHA256_DIGEST_LENGTH];
 	struct share_user user;
 	size_t len;
 	unsigned int i;
@@ -233,25 +235,17 @@ int lastpass_share_create(const struct session *session, const char *sharename)
 	if (ret)
 		die("Unable to get pubkey for your user (%d)\n", ret);
 
-	xasprintf(&sf_username, "%s-%s", user.username, sharename);
+	xasprintf(&sf_fullname, "Shared-%s", sharename);
+	xasprintf(&sf_username, "%s-%s", user.username, sf_fullname);
 	for (i=0; i < strlen(sf_username); i++)
 		if (sf_username[i] == ' ')
 			sf_username[i] = '_';
 
-	/*
-	 * generate random sharing key.  kdf_decryption_key wants a string so
-	 * we remove any zeroes except the terminator.
-	 */
-	get_random_bytes(pw, sizeof(pw));
-	pw[sizeof(pw)-1] = 0;
-	for (i=0; i < sizeof(pw)-1; i++) {
-		if (!pw[i])
-			pw[i] = (unsigned char) range_rand(1, 256);
-	}
-
-	kdf_decryption_key(sf_username, (char *) pw, 1, key);
-	kdf_login_key(sf_username, (char *) pw, 1, hash);
+	get_random_bytes(key, sizeof(key));
 	bytes_to_hex(key, &hex_share_key, sizeof(key));
+
+	hex_hash = cipher_multi_sha256_hex(2, xstrlower(sf_username), hex_share_key);
+	hex_hash = cipher_multi_sha256_hex(2, hex_hash, hex_share_key);
 
 	/*
 	 * Sharing key is hex-encoded then RSA-encrypted with our pubkey.
@@ -266,7 +260,6 @@ int lastpass_share_create(const struct session *session, const char *sharename)
 
 	bytes_to_hex(enc_share_key, &hex_enc_share_key, enc_share_key_len);
 
-	xasprintf(&sf_fullname, "Shared-%s", sharename);
 	enc_share_name = encrypt_and_base64(sf_fullname, key);
 
 	reply = http_post_lastpass("share.php", session, &len,
@@ -274,7 +267,7 @@ int lastpass_share_create(const struct session *session, const char *sharename)
 				   "id", "0",
 				   "update", "1",
 				   "newusername", sf_username,
-				   "newhash", hash,
+				   "newhash", hex_hash,
 				   "sharekey", hex_enc_share_key,
 				   "name", sf_fullname,
 				   "sharename", enc_share_name,
@@ -324,18 +317,33 @@ int lastpass_share_move(const struct session *session,
 
 	bytes_to_hex((unsigned char *) account->url, &url, strlen(account->url));
 
-	http_post_add_params(&params,
-			     "token", session->token,
-			     "cmd", "uploadaccounts",
-			     "aid0", account->id,
-			     "name0", account->name_encrypted,
-			     "grouping0", account->group_encrypted,
-			     "url0", url,
-			     "username0", account->username_encrypted,
-			     "password0", account->password_encrypted,
-			     "pwprotect0", account->pwprotect ? "on" : "off",
-			     "extra0", account->note_encrypted,
-			     "todelete", account->id, NULL);
+	if (session->feature_flag.url_encryption_enabled) {
+		http_post_add_params(&params,
+			"token", session->token,
+			"cmd", "uploadaccounts",
+			"aid0", account->id,
+			"name0", account->name_encrypted,
+			"grouping0", account->group_encrypted,
+			"url0", account->url_encrypted,
+			"username0", account->username_encrypted,
+			"password0", account->password_encrypted,
+			"pwprotect0", account->pwprotect ? "on" : "off",
+			"extra0", account->note_encrypted,
+			"todelete", account->id, NULL);
+	} else {
+		http_post_add_params(&params,
+			"token", session->token,
+			"cmd", "uploadaccounts",
+			"aid0", account->id,
+			"name0", account->name_encrypted,
+			"grouping0", account->group_encrypted,
+			"url0", url,
+			"username0", account->username_encrypted,
+			"password0", account->password_encrypted,
+			"pwprotect0", account->pwprotect ? "on" : "off",
+			"extra0", account->note_encrypted,
+			"todelete", account->id, NULL);
+	}
 
 	if (account->share) {
 		http_post_add_params(&params,
@@ -347,6 +355,10 @@ int lastpass_share_move(const struct session *session,
 		http_post_add_params(&params,
 				     "origsharedfolderid", orig_folder->id,
 				     NULL);
+	}
+
+	if (session->feature_flag.url_logging_enabled) {
+		http_post_add_params(&params, "recordUrl", url, NULL);
 	}
 
 	reply = http_post_lastpass_param_set("lastpass/api.php",
